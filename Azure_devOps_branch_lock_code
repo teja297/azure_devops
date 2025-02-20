@@ -1,0 +1,39 @@
+trigger:
+  - 'qa'
+ 
+pool:
+  vmImage: 'windows-latest'  # Using Windows latest pipeline agent
+ 
+variables:
+  ORGANIZATION: "https://dev.azure.com/Forward-IT"
+  PROJECT: "FA-Waybill"
+  REPOSITORY_NAME: "faauth"  # Replace with your actual repo name
+ 
+steps:
+- powershell: |
+    Write-Host "Installing/updating Azure DevOps CLI..."
+    az extension add --name azure-devops --upgrade
+    Write-Host "Configuring defaults..."
+    az devops configure --defaults organization="$(ORGANIZATION)" project="$(PROJECT)"
+ 
+    Write-Host "Logging into Azure DevOps..."
+    $env:AZURE_DEVOPS_EXT_PAT = "$(AZURE_DEVOPS_PAT)"
+    az devops login --organization "$(ORGANIZATION)"
+ 
+    Write-Host "Fetching repository ID for repository: $(REPOSITORY_NAME)..."
+    $repositoryId = az repos show --repository "$(REPOSITORY_NAME)" --organization "$(ORGANIZATION)" --project "$(PROJECT)" --query id --output tsv
+    if (-not $repositoryId) {
+        Write-Host "##[error] Repository '$(REPOSITORY_NAME)' not found."
+        exit 1
+    }
+    Write-Host "✅ Repository ID: $repositoryId"
+ 
+    Write-Host "Listing all refs in repository $(REPOSITORY_NAME)..."
+    az repos ref list --repository "$repositoryId" --organization "$(ORGANIZATION)" --project "$(PROJECT)" -o table
+ 
+    Write-Host "Locking branch 'develop'..."
+    az repos ref lock --repository "$repositoryId" --organization "$(ORGANIZATION)" --project "$(PROJECT)" --name "heads/develop"
+    Write-Host "✅ Branch 'develop' is now locked."
+  displayName: 'Authenticate & Execute Commands'
+  env:
+    AZURE_DEVOPS_PAT: $(AZURE_DEVOPS_PAT)
