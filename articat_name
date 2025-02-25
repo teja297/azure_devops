@@ -1,0 +1,176 @@
+trigger:
+  branches:
+    include:
+      - develop
+      - feat/*
+      - hotfix/*
+  tags:
+    include:
+      - 'RC_*'
+ 
+pr:
+  branches:
+    include:
+      - develop
+      - qa
+      - prod
+      - master
+ 
+pool:
+  name: 'JBoss Dev'
+  demands:
+    - agent.name -equals DEVOPSJB01D
+    - maven
+ 
+variables:
+  mavenPOMFile: 'pom.xml'
+  ORGANIZATION: 'https://dev.azure.com/Forward-IT'
+  PROJECT: 'FA-Waybill'
+  REPOSITORY_NAME: 'hellojboss'
+ 
+parameters:
+  - name: versionType
+    type: string
+    values:
+      - major
+      - minor
+      - patch
+    default: patch
+ 
+stages:
+  - stage: VersionBump_Develop
+    displayName: Version Bump develop
+    condition: eq(variables['Build.SourceBranch'], 'refs/heads/develop')
+    jobs:
+      - job: BumpVersion
+        displayName: Bump Version
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+            displayName: Checkout Repository
+            persistCredentials: true
+            clean: true
+ 
+          - script: |
+              git config user.email "ravindra.reddy@forwardair.com"
+              git config user.name "ravindra.reddy"
+              git fetch --all
+              git checkout develop
+            displayName: Configure Git
+ 
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '3.x'
+            displayName: Set up Python
+ 
+          - script: |
+              sudo apt update && sudo apt install xmlstarlet -y
+              pip install --upgrade bump2version
+            displayName: Install Dependencies
+ 
+          - script: |
+              echo "Bumping from old Version $(cat VERSION)"
+              bumpversion patch
+              NEW_VERSION=$(cat VERSION)
+              xmlstarlet ed -L -N x=http://maven.apache.org/POM/4.0.0 -u "/x:project/x:version" -v "$NEW_VERSION" pom.xml
+              echo "Version updated to $NEW_VERSION"
+            displayName: Bump Version
+ 
+          - script: |
+              git status
+              git add .
+              git commit -m "BumpVersion Dev [skip ci]" || echo "No changes to commit"
+              git push https://$(PAT)@dev.azure.com/Forward-IT/$(PROJECT)/_git/$(REPOSITORY_NAME) develop
+            displayName: Commit and Push Changes
+            env:
+              System.AccessToken: $(System.AccessToken)
+ 
+          - script: |
+              mkdir temp
+              mv VERSION pom.xml temp/
+              mv .bumpversion.cfg temp/
+            displayName: Prepare Artifacts
+ 
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: 'temp'
+              artifactName: 'temp'
+            displayName: Publish VERSION Artifacts
+ 
+  - stage: Build
+    displayName: "Build Stage"
+    condition: always()
+    jobs:
+      - job: BuildJob
+        displayName: "Build the Project"
+        steps:
+          - task: DownloadBuildArtifacts@0
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: 'temp'
+              downloadPath: '$(Build.ArtifactStagingDirectory)'
+            displayName: 'Download VERSION Artifact'
+ 
+          - powershell: |
+              $branchName = "$(Build.SourceBranchName)".Replace("/", "-").Replace("_", "-")
+              $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+              $version = Get-Content "$(Build.ArtifactStagingDirectory)/temp/VERSION" -Raw
+              $artifactVersion = "$version-$branchName-$timestamp"
+              Write-Host "Generated Artifact Version: $artifactVersion"
+              Write-Host "##vso[task.setvariable variable=ArtifactVersion;isOutput=true]$artifactVersion"
+            name: GenerateVersion
+            displayName: "Generate Unique Artifact Version"
+ 
+          - task: Maven@3
+            displayName: 'Build with Maven'
+            inputs:
+              mavenPomFile: '$(mavenPOMFile)'
+              goals: 'package -DskipTests'
+ 
+          - powershell: |
+              $artifactVersion = "$(GenerateVersion.ArtifactVersion)"
+              Write-Host "Using Artifact Version: $artifactVersion"
+              $warFile = Get-ChildItem -Path "$(System.DefaultWorkingDirectory)" -Filter "*.war" -Recurse | Select-Object -First 1
+              if ($warFile) {
+                  $newFileName = "$($warFile.DirectoryName)\hellojboss-$artifactVersion.war"
+                  Rename-Item -Path $warFile.FullName -NewName $newFileName
+                  Write-Host "Renamed WAR file to: $newFileName"
+                  Write-Host "##vso[task.setvariable variable=RenamedWarFile]$newFileName"
+              } else {
+                  Write-Host "No WAR file found!"
+                  exit 1
+              }
+            displayName: "Rename WAR File with Version"
+ 
+          - task: CopyFiles@2
+            displayName: 'Copy WAR Files to Artifact Staging'
+            inputs:
+              SourceFolder: '$(System.DefaultWorkingDirectory)'
+              Contents: '**/*.war'
+              TargetFolder: '$(Build.ArtifactStagingDirectory)'
+ 
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Build Artifacts'
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)/'
+              ArtifactName: 'drop-$(GenerateVersion.ArtifactVersion)'
+ 
+          - task: MavenAuthenticate@0
+            inputs:
+              artifactsFeeds: 'FA-Waybill'
+              mavenServiceConnections: 'SC_FA-Waybill_Feed'
+ 
+          - task: Maven@4
+            displayName: 'Deploy to Azure Artifacts'
+            inputs:
+              mavenPomFile: '$(mavenPOMFile)'
+              goals: 'deploy'
+              publishJUnitResults: false
+              javaHomeOption: 'JDKVersion'
+              mavenVersionOption: 'Default'
+              mavenAuthenticateFeed: true
+              effectivePomSkip: false
+              sonarQubeRunAnalysis: false
+              options: '-Drevision=$(GenerateVersion.ArtifactVersion) -Dfile=$(RenamedWarFile)'
